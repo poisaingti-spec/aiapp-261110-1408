@@ -1,0 +1,45 @@
+name: AI App build
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+      - name: Build debug APK
+        run: |
+          set -o pipefail
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug --stacktrace 2>&1 | tee build.log
+          else
+            gradle assembleDebug --stacktrace 2>&1 | tee build.log
+          fi
+      - name: Report errors
+        if: failure()
+        run: |
+          grep -E "^e: |error:|What went wrong|Could not resolve|FAILURE" -A2 build.log | head -60 | while IFS= read -r l; do
+            echo "::error::${l//%/%25}"
+          done
+      - name: Collect APK
+        run: |
+          APK=$(find . -path "*/build/outputs/apk/*" -name "*.apk" | head -n 1)
+          if [ -z "$APK" ]; then echo "No APK was produced"; exit 1; fi
+          cp "$APK" app-${{ github.run_number }}.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: app-*.apk
+          make_latest: true
