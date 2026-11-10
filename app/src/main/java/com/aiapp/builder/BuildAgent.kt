@@ -68,7 +68,7 @@ class BuildAgent(
     private val gh = GitHubClient(req.githubToken)
     private val slug = (req.project?.appName ?: req.appName).lowercase().replace(Regex("[^a-z0-9]+"), "").ifEmpty { "app" }.take(30)
     private val packageName = req.project?.packageName
-        ?: req.customPackageName?.takeIf { it.matches(Regex("^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$")) }
+        ?: req.customPackageName?.takeIf { it.matches(Regex("^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$")) }
         ?: ("com.aibuilt." + (if (slug.first().isLetter()) slug else "a$slug"))
     private val appName get() = req.project?.appName ?: importedName ?: req.appName
 

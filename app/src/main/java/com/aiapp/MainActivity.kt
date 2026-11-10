@@ -58,10 +58,10 @@ class MainActivity : ComponentActivity() {
         chatVm.handleOAuthIntent(intent)
         setContent {
             AppTheme {
-                val vm: ChatViewModel = viewModel()
-                val buildVm: BuildViewModel = viewModel()
-                val createVm: CreateViewModel = viewModel()
-                val reaVm: ReaViewModel = viewModel()
+                val vm: ChatViewModel = viewModel<ChatViewModel>()
+                val buildVm: BuildViewModel = viewModel<BuildViewModel>()
+                val createVm: CreateViewModel = viewModel<CreateViewModel>()
+                val reaVm: ReaViewModel = viewModel<ReaViewModel>()
 
                 var screen by rememberSaveable { mutableStateOf("chat") }
                 var previousScreen by rememberSaveable { mutableStateOf("chat") }
