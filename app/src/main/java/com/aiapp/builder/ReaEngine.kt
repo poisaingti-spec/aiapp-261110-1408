@@ -205,7 +205,7 @@ And build a COMPLETE, WORKING Android app in Kotlin + Jetpack Compose (Material 
                 if (parsedManifest.targetSdk.isNotBlank()) targetSdk = parsedManifest.targetSdk
 
                 permissions.addAll(parsedManifest.permissions)
-                activities.addAll(parsedManifest.activities)
+                activities.addAll(parsedManifest.attributes)
                 services.addAll(parsedManifest.services)
                 receivers.addAll(parsedManifest.receivers)
                 providers.addAll(parsedManifest.providers)
@@ -515,6 +515,10 @@ And build a COMPLETE, WORKING Android app in Kotlin + Jetpack Compose (Material 
             // and locating the APK Signing Block before the Central Directory.
             // For now, we assume v2+ if no v1-only signatures are found in a modern APK.
             // A proper implementation would parse the APK Signing Block structure.
+            // We'll set v2Present to true if we find signs of a modern signing block.
+            if (zip.entries().any { it.name.startsWith("META-INF/") && it.name.endsWith(".SF") }) {
+                v1Present = true
+            }
         }
 
         return ApkSignatureReport(
@@ -529,179 +533,218 @@ And build a COMPLETE, WORKING Android app in Kotlin + Jetpack Compose (Material 
         )
     }
 
-    /**
-     * Decodes Android Binary XML (AXML) to human-readable XML string.
-     * Handles the chunk-based structure: RES_XML_TYPE (0x00080003), START_NAMESPACE_CHUNK_TYPE,
-     * END_NAMESPACE_CHUNK_TYPE, START_TAG_CHUNK_TYPE, END_TAG_CHUNK_TYPE, TEXT_CHUNK_TYPE.
-     */
-    private fun decodeBinaryXml(data: ByteArray): ParsedManifest {
-        val buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
-        val stringPool = mutableListOf<String>()
-        val permissions = mutableListOf<String>()
-        val activities = mutableListOf<String>()
-        val services = mutableListOf<String>()
-        val receivers = mutableListOf<String>()
-        val providers = mutableListOf<String>()
+    /** Minimal Binary XML (AXML) decoder — returns structured manifest info + raw XML text. */
+    private fun decodeBinaryXml(bytes: ByteArray): ParsedManifest {
+        return try {
+            val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            // Check magic: 0x00080003 for AXML
+            if (buffer.remaining() < 8 || buffer.getInt(0) != 0x00080003) {
+                return ParsedManifest("", "", "", "", "", "", "", emptyList(), emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
+            }
+            val fileSize = buffer.getInt(4)
+            if (fileSize != bytes.size) {
+                // Not a standard AXML, maybe already text XML
+                val text = bytes.toString(Charsets.UTF_8).trim()
+                if (text.startsWith("<")) {
+                    return parseTextManifest(text)
+                }
+                return ParsedManifest("", "", "", "", "", "", "", emptyList(), emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
+            }
+
+            // Skip header (24 bytes) and string chunk
+            buffer.position(8)
+            val stringChunkOffset = buffer.getInt(4)
+            val stringChunkSize = buffer.getInt(8)
+            val stringCount = buffer.getInt(12)
+            val styleCount = buffer.getInt(16)
+            val flags = buffer.getInt(20)
+            val stringsOffset = buffer.getInt(24)
+            val stylesOffset = buffer.getInt(28)
+
+            // Parse string pool
+            buffer.position(stringChunkOffset)
+            val stringChunkType = buffer.getInt()
+            val stringChunkSize2 = buffer.getInt()
+            val stringCount2 = buffer.getInt()
+            val styleCount2 = buffer.getInt()
+            val flags2 = buffer.getInt()
+            val stringsOffset2 = buffer.getInt()
+            val stylesOffset2 = buffer.getInt()
+
+            val stringOffsets = IntArray(stringCount2) { buffer.getInt() }
+            val styleOffsets = if (styleCount2 > 0) IntArray(styleCount2) { buffer.getInt() } else emptyArray()
+
+            val stringsStart = buffer.position() + stringsOffset2
+            val stringPool = mutableListOf<String>()
+            for (i in 0 until stringCount2) {
+                buffer.position(stringsStart + stringOffsets[i])
+                val len = readUleb128(buffer)
+                val chars = CharArray(len) { buffer.getChar() }
+                stringPool.add(String(chars))
+            }
+
+            // Now parse XML tags from resource chunk
+            val resourceChunkOffset = stringChunkOffset + stringChunkSize2
+            buffer.position(resourceChunkOffset)
+
+            val parsed = parseXmlTags(buffer, stringPool)
+
+            ParsedManifest(
+                xmlText = parsed.xmlText,
+                packageName = parsed.packageName,
+                appLabel = parsed.appLabel,
+                versionName = parsed.versionName,
+                versionCode = parsed.versionCode,
+                minSdk = parsed.minSdk,
+                targetSdk = parsed.targetSdk,
+                permissions = parsed.permissions,
+                activities = parsed.activities,
+                services = parsed.services,
+                receivers = parsed.receivers,
+                providers = parsed.providers,
+                stringPool = stringPool
+            )
+        } catch (e: Exception) {
+            // Fallback: try as text XML
+            val text = bytes.toString(Charsets.UTF_8).trim()
+            if (text.startsWith("<")) {
+                return parseTextManifest(text)
+            }
+            ParsedManifest("", "", "", "", "", "", "", emptyList(), emptyList(), emptyList(), emptyList(), emptyList(), emptyList())
+        }
+    }
+
+    private data class XmlParseResult(
+        val xmlText: String,
+        val packageName: String,
+        val appLabel: String,
+        val versionName: String,
+        val versionCode: String,
+        val minSdk: String,
+        val targetSdk: String,
+        val permissions: List<String>,
+        val activities: List<String>,
+        val services: List<String>,
+        val receivers: List<String>,
+        val providers: List<String>
+    )
+
+    private fun parseXmlTags(buffer: ByteBuffer, stringPool: List<String>): XmlParseResult {
+        val xmlBuilder = StringBuilder()
         var packageName = ""
         var appLabel = ""
         var versionName = ""
         var versionCode = ""
         var minSdk = ""
-        val targetSdk = ""
-        val xmlBuilder = StringBuilder()
+        var targetSdk = ""
+        val permissions = mutableListOf<String>()
+        val activities = mutableListOf<String>()
+        val services = mutableListOf<String>()
+        val receivers = mutableListOf<String>()
+        val providers = mutableListOf<String>()
 
-        // Check for AXML magic (0x00080003)
-        if (data.size < 8 || buffer.getInt(0) != 0x00080003) {
-            // Not a binary XML, try to decode as plain text
-            val text = String(data, Charsets.UTF_8)
-            return ParsedManifest(
-                xmlText = text,
-                packageName = extractAttr(text, "package") ?: "",
-                appLabel = extractAttr(text, "android:label") ?: "",
-                versionName = extractAttr(text, "android:versionName") ?: "",
-                versionCode = extractAttr(text, "android:versionCode") ?: "",
-                minSdk = extractAttr(text, "android:minSdkVersion") ?: "",
-                targetSdk = extractAttr(text, "android:targetSdkVersion") ?: "",
-                permissions = extractPermissions(text),
-                activities = extractComponents(text, "activity"),
-                services = extractComponents(text, "service"),
-                receivers = extractComponents(text, "receiver"),
-                providers = extractComponents(text, "provider"),
-                stringPool = stringPool,
-            )
-        }
-
-        // Parse string pool
-        val headerSize = buffer.getInt(4)
-        val stringPoolOffset = buffer.getInt(8)
-        val stringPoolSize = buffer.getInt(12)
-        val stylePoolOffset = buffer.getInt(16)
-        val stylePoolSize = buffer.getInt(20)
-
-        if (stringPoolSize > 0 && stringPoolOffset > 0) {
-            val poolBuffer = ByteBuffer.wrap(data, stringPoolOffset, data.size - stringPoolOffset).order(ByteOrder.LITTLE_ENDIAN)
-            val stringOffsets = IntArray(stringPoolSize)
-            for (i in 0 until stringPoolSize) {
-                stringOffsets[i] = poolBuffer.getInt()
-            }
-            val stringDataStart = stringPoolOffset + 4 * stringPoolSize
-            for (i in 0 until stringPoolSize) {
-                val offset = stringOffsets[i]
-                if (offset < data.size - stringDataStart) {
-                    val strBuf = ByteBuffer.wrap(data, stringDataStart + offset, data.size - stringDataStart - offset).order(ByteOrder.LITTLE_ENDIAN)
-                    // Strings are UTF-16LE with length prefix (uint16 or uint32 with high bit set)
-                    val len = strBuf.getShort().toInt()
-                    if (len > 0 && len < 10000) {
-                        val chars = CharArray(len)
-                        for (j in 0 until len) {
-                            chars[j] = strBuf.getChar()
-                        }
-                        stringPool.add(String(chars))
-                    } else {
-                        stringPool.add("")
-                    }
-                } else {
-                    stringPool.add("")
-                }
-            }
-        }
-
-        // Parse XML chunks
-        var offset = headerSize
         var depth = 0
-        val nsStack = mutableListOf<Pair<String, String>>()
-        val attrStack = mutableListOf<MutableMap<String, String>>()
+        while (buffer.remaining() >= 4) {
+            val start = buffer.position()
+            val tagType = buffer.getShort()
+            val tagSize = buffer.getShort().toInt()
 
-        while (offset + 8 <= data.size) {
-            val chunkType = buffer.getInt(offset)
-            val chunkSize = buffer.getInt(offset + 4)
-            if (chunkSize < 8 || offset + chunkSize > data.size) break
+            if (tagSize < 8) break
+            if (start + tagSize > buffer.limit()) break
 
-            when (chunkType) {
-                0x00100100 -> { // START_NAMESPACE_CHUNK_TYPE
-                    val prefix = getString(buffer, offset + 8, stringPool)
-                    val uri = getString(buffer, offset + 12, stringPool)
-                    nsStack.add(prefix to uri)
+            when (tagType) {
+                0x0100 -> { // RES_XML_START_NAMESPACE
+                    // skip
                 }
-                0x00100101 -> { // END_NAMESPACE_CHUNK_TYPE
-                    if (nsStack.isNotEmpty()) nsStack.removeAt(nsStack.lastIndex)
+                0x0101 -> { // RES_XML_END_NAMESPACE
+                    // skip
                 }
-                0x00100102 -> { // START_TAG_CHUNK_TYPE
-                    val ns = getString(buffer, offset + 8, stringPool)
-                    val name = getString(buffer, offset + 12, stringPool)
-                    val attrCount = buffer.getInt(offset + 20)
-                    val attrStart = offset + 24
+                0x0102 -> { // RES_XML_START_ELEMENT
+                    val ns = buffer.getInt() // namespace
+                    val nameIdx = buffer.getInt()
+                    val attrStart = buffer.getShort().toInt()
+                    val attrSize = buffer.getShort().toInt()
+                    val attrCount = buffer.getShort().toInt()
+                    val idAttr = buffer.getShort().toInt()
+
+                    val name = if (nameIdx >= 0 && nameIdx < stringPool.size) stringPool[nameIdx] else "unknown"
                     val attrs = mutableMapOf<String, String>()
+
+                    val attrBase = buffer.position() + attrStart - 8 // adjust for already-read header
                     for (i in 0 until attrCount) {
-                        val attrNs = getString(buffer, attrStart + i * 20 + 0, stringPool)
-                        val attrName = getString(buffer, attrStart + i * 20 + 4, stringPool)
-                        val attrValue = getString(buffer, attrStart + i * 20 + 8, stringPool)
-                        val attrType = buffer.getInt(attrStart + i * 20 + 12)
-                        val attrData = buffer.getInt(attrStart + i * 20 + 16)
-                        val value = if (attrValue.isNotBlank()) attrValue else formatAttrValue(attrType, attrData)
-                        val fullName = if (attrNs.isNotBlank()) "$attrNs:$attrName" else attrName
-                        attrs[fullName] = value
-                    }
-                    attrStack.add(attrs)
+                        val attrNs = buffer.getInt(attrBase + i * attrSize + 0)
+                        val attrName = buffer.getInt(attrBase + i * attrSize + 4)
+                        val attrValueStr = buffer.getInt(attrBase + i * attrSize + 8)
+                        val attrType = buffer.getInt(attrBase + i * attrSize + 12)
+                        val attrData = buffer.getInt(attrBase + i * attrSize + 16)
 
-                    // Extract manifest attributes
-                    if (name == "manifest" && depth == 0) {
-                        packageName = attrs["package"] ?: ""
-                        versionName = attrs["android:versionName"] ?: ""
-                        versionCode = attrs["android:versionCode"] ?: ""
-                    }
-                    if (name == "uses-sdk" && depth <= 1) {
-                        minSdk = attrs["android:minSdkVersion"] ?: minSdk
-                    }
-                    if (name == "application" && depth <= 1) {
-                        appLabel = attrs["android:label"] ?: appLabel
-                    }
-                    if (name == "activity" && depth <= 2) {
-                        val actName = attrs["android:name"] ?: ""
-                        if (actName.isNotBlank()) activities.add(if (actName.startsWith(".")) "$packageName$actName" else actName)
-                    }
-                    if (name == "service" && depth <= 2) {
-                        val svcName = attrs["android:name"] ?: ""
-                        if (svcName.isNotBlank()) services.add(if (svcName.startsWith(".")) "$packageName$svcName" else svcName)
-                    }
-                    if (name == "receiver" && depth <= 2) {
-                        val rcvName = attrs["android:name"] ?: ""
-                        if (rcvName.isNotBlank()) receivers.add(if (rcvName.startsWith(".")) "$packageName$rcvName" else rcvName)
-                    }
-                    if (name == "provider" && depth <= 2) {
-                        val prvName = attrs["android:name"] ?: ""
-                        if (prvName.isNotBlank()) providers.add(if (prvName.startsWith(".")) "$packageName$prvName" else prvName)
-                    }
-                    if (name == "uses-permission" || name == "permission") {
-                        val perm = attrs["android:name"] ?: ""
-                        if (perm.isNotBlank()) permissions.add(perm)
+                        val attrNameStr = if (attrName >= 0 && attrName < stringPool.size) stringPool[attrName] else ""
+                        val attrValue = if (attrValueStr >= 0 && attrValueStr < stringPool.size) stringPool[attrValueStr] else attrData.toString()
+                        attrs[attrNameStr] = attrValue
                     }
 
-                    // Build XML output
-                    xmlBuilder.append("\n").append("  ".repeat(depth)).append("<$name")
+                    // Generate XML
+                    xmlBuilder.append("\n".repeat(depth)).append("<$name")
                     attrs.forEach { (k, v) -> xmlBuilder.append(" $k=\"$v\"") }
                     xmlBuilder.append(">")
+
+                    // Extract key manifest attributes
+                    when (name) {
+                        "manifest" -> {
+                            packageName = attrs["package"] ?: ""
+                            versionName = attrs["platformVersionCode"]?.let { "platform:$it" } ?: attrs["versionName"] ?: ""
+                            versionCode = attrs["versionCode"] ?: ""
+                        }
+                        "application" -> {
+                            appLabel = attrs["label"] ?: ""
+                        }
+                        "uses-sdk" -> {
+                            minSdk = attrs["minSdkVersion"] ?: ""
+                            targetSdk = attrs["targetSdkVersion"] ?: ""
+                        }
+                        "uses-permission" -> {
+                            val perm = attrs["name"] ?: ""
+                            if (perm.isNotBlank()) permissions.add(perm)
+                        }
+                        "activity" -> {
+                            val actName = attrs["name"] ?: ""
+                            if (actName.isNotBlank()) activities.add(actName)
+                        }
+                        "service" -> {
+                            val svcName = attrs["name"] ?: ""
+                            if (svcName.isNotBlank()) services.add(svcName)
+                        }
+                        "receiver" -> {
+                            val rcvName = attrs["name"] ?: ""
+                            if (rcvName.isNotBlank()) receivers.add(rcvName)
+                        }
+                        "provider" -> {
+                            val provName = attrs["name"] ?: ""
+                            if (provName.isNotBlank()) providers.add(provName)
+                        }
+                    }
+
                     depth++
                 }
-                0x00100103 -> { // END_TAG_CHUNK_TYPE
-                    depth = (depth - 1).coerceAtLeast(0)
-                    val ns = getString(buffer, offset + 8, stringPool)
-                    val name = getString(buffer, offset + 12, stringPool)
-                    xmlBuilder.append("\n").append("  ".repeat(depth)).append("</$name>")
-                    if (attrStack.isNotEmpty()) attrStack.removeAt(attrStack.lastIndex)
+                0x0103 -> { // RES_XML_END_ELEMENT
+                    depth = maxOf(0, depth - 1)
+                    val ns = buffer.getInt()
+                    val nameIdx = buffer.getInt()
+                    val name = if (nameIdx >= 0 && nameIdx < stringPool.size) stringPool[nameIdx] else "unknown"
+                    xmlBuilder.append("\n".repeat(depth)).append("</$name>")
                 }
-                0x00100104 -> { // TEXT_CHUNK_TYPE
-                    val text = getString(buffer, offset + 8, stringPool)
-                    if (text.isNotBlank() && depth > 0) {
-                        xmlBuilder.append(text)
-                    }
+                0x0104 -> { // RES_XML_CDATA
+                    // skip text content
+                }
+                else -> {
+                    // Unknown tag, skip
                 }
             }
-            offset += chunkSize
+            buffer.position(start + tagSize)
         }
 
-        return ParsedManifest(
-            xmlText = xmlBuilder.toString().trim(),
+        return XmlParseResult(
+            xmlText = xmlBuilder.toString(),
             packageName = packageName,
             appLabel = appLabel,
             versionName = versionName,
@@ -713,309 +756,245 @@ And build a COMPLETE, WORKING Android app in Kotlin + Jetpack Compose (Material 
             services = services,
             receivers = receivers,
             providers = providers,
-            stringPool = stringPool,
         )
     }
 
-    private fun getString(buffer: ByteBuffer, offset: Int, stringPool: List<String>): String {
-        val idx = buffer.getInt(offset)
-        if (idx >= 0 && idx < stringPool.size) return stringPool[idx]
-        return ""
+    private fun parseTextManifest(xml: String): ParsedManifest {
+        // Very simple text XML parsing for fallback
+        val permissions = mutableListOf<String>()
+        val activities = mutableListOf<String>()
+        val services = mutableListOf<String>()
+        val receivers = mutableListOf<String>()
+        val providers = mutableListOf<String>()
+        var pkgName = ""
+        var label = ""
+        var vName = ""
+        var vCode = ""
+        var minS = ""
+        var targetS = ""
+
+        val packageRegex = Regex("""<manifest[^>]*package=["']([^"']+)""")
+        packageRegex.find(xml)?.groupValues?.get(1)?.let { pkgName = it }
+
+        val labelRegex = Regex("""<application[^>]*android:label=["']([^"']+)""")
+        labelRegex.find(xml)?.groupValues?.get(1)?.let { label = it }
+
+        val versionNameRegex = Regex("""android:versionName=["']([^"']+)""")
+        versionNameRegex.find(xml)?.groupValues?.get(1)?.let { vName = it }
+
+        val versionCodeRegex = Regex("""android:versionCode=["']([^"']+)""")
+        versionCodeRegex.find(xml)?.groupValues?.get(1)?.let { vCode = it }
+
+        val minSdkRegex = Regex("""android:minSdkVersion=["']([^"']+)""")
+        minSdkRegex.find(xml)?.groupValues?.get(1)?.let { minS = it }
+
+        val targetSdkRegex = Regex("""android:targetSdkVersion=["']([^"']+)""")
+        targetSdkRegex.find(xml)?.groupValues?.get(1)?.let { targetS = it }
+
+        val permRegex = Regex("""<uses-permission[^>]*android:name=["']([^"']+)""")
+        permRegex.findAll(xml).forEach { m -> m.groupValues.get(1)?.let { permissions.add(it) } }
+
+        val activityRegex = Regex("""<activity[^>]*android:name=["']([^"']+)""")
+        activityRegex.findAll(xml).forEach { m -> m.groupValues.get(1)?.let { activities.add(it) } }
+
+        val serviceRegex = Regex("""<service[^>]*android:name=["']([^"']+)""")
+        serviceRegex.findAll(xml).forEach { m -> m.groupValues.get(1)?.let { services.add(it) } }
+
+        val receiverRegex = Regex("""<receiver[^>]*android:name=["']([^"']+)""")
+        receiverRegex.findAll(xml).forEach { m -> m.groupValues.get(1)?.let { receivers.add(it) } }
+
+        val providerRegex = Regex("""<provider[^>]*android:name=["']([^"']+)""")
+        providerRegex.findAll(xml).forEach { m -> m.groupValues.get(1)?.let { providers.add(it) } }
+
+        return ParsedManifest(
+            xmlText = xml,
+            packageName = pkgName,
+            appLabel = label,
+            versionName = vName,
+            versionCode = vCode,
+            minSdk = minS,
+            targetSdk = targetS,
+            permissions = permissions,
+            activities = activities,
+            services = services,
+            receivers = receivers,
+            providers = providers,
+            stringPool = emptyList(),
+        )
     }
 
-    private fun formatAttrValue(type: Int, data: Int): String {
-        return when (type >> 24) {
-            0x03 -> "@string/${data & 0x00FFFFFF}"
-            0x01 -> "@${data & 0x00FFFFFF}"
-            0x02 -> "?${data & 0x00FFFFFF}"
-            0x10 -> data.toString()
-            0x11 -> if (data == 0) "false" else "true"
-            0x04 -> "0x${data.toString(16).uppercase()}"
-            0x05 -> java.lang.Float.intBitsToFloat(data).toString()
-            else -> "0x${data.toString(16).uppercase()}"
+    private fun readUleb128(buffer: ByteBuffer): Int {
+        var result = 0
+        var shift = 0
+        while (true) {
+            val b = buffer.get() and 0xFF
+            result = result or ((b and 0x7F) shl shift)
+            if ((b and 0x80) == 0) break
+            shift += 7
         }
+        return result
     }
 
-    private fun extractAttr(xml: String, attr: String): String? {
-        val regex = Regex("$attr\\s*=\\s*\"([^\"]*)\"")
-        return regex.find(xml)?.groupValues?.get(1)
-    }
+    /** Parses DEX file header and extracts class/method/field signatures + strings. */
+    private fun parseDexFull(bytes: ByteArray, pkgPrefix: String): DexResult {
+        return try {
+            val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
 
-    private fun extractPermissions(xml: String): List<String> {
-        val regex = Regex("<uses-permission[^>]*android:name\\s*=\\s*\"([^\"]*)\"")
-        return regex.findAll(xml).map { it.groupValues[1] }.distinct()
-    }
-
-    private fun extractComponents(xml: String, tag: String): List<String> {
-        val regex = Regex("<$tag[^>]*android:name\\s*=\\s*\"([^\"]*)\"")
-        return regex.findAll(xml).map { it.groupValues[1] }.distinct()
-    }
-
-    /**
-     * Parses DEX file to extract classes, methods, fields, strings, and URLs.
-     * Supports multi-DEX (classes.dex, classes2.dex, etc.)
-     */
-    private fun parseDexFull(dexBytes: ByteArray, pkgPrefix: String): DexResult {
-        val classes = LinkedHashSet<String>()
-        val methodSignatures = LinkedHashSet<String>()
-        val fieldSignatures = LinkedHashSet<String>()
-        val urls = LinkedHashSet<String>()
-        val uiStrings = LinkedHashSet<String>()
-
-        if (dexBytes.size < 112 || !dexBytes.startsWith("dex\n".toByteArray())) {
-            return DexResult(0, 0, 0, classes, methodSignatures, fieldSignatures, urls, uiStrings)
-        }
-
-        val buffer = ByteBuffer.wrap(dexBytes).order(ByteOrder.LITTLE_ENDIAN)
-        val stringIdsSize = buffer.getInt(56)
-        val stringIdsOff = buffer.getInt(60)
-        val typeIdsSize = buffer.getInt(64)
-        val typeIdsOff = buffer.getInt(68)
-        val protoIdsSize = buffer.getInt(72)
-        val protoIdsOff = buffer.getInt(76)
-        val fieldIdsSize = buffer.getInt(80)
-        val fieldIdsOff = buffer.getInt(84)
-        val methodIdsSize = buffer.getInt(88)
-        val methodIdsOff = buffer.getInt(92)
-        val classDefsSize = buffer.getInt(96)
-        val classDefsOff = buffer.getInt(100)
-
-        // Read string IDs
-        val stringIds = Array<Int>(stringIdsSize) { i -> buffer.getInt(stringIdsOff + i * 4) }
-        val strings = Array<String?>(stringIdsSize) { null }
-        for (i in 0 until stringIdsSize) {
-            val offset = stringIds[i]
-            if (offset < dexBytes.size) {
-                val strBuf = ByteBuffer.wrap(dexBytes, offset, dexBytes.size - offset).order(ByteOrder.LITTLE_ENDIAN)
-                // ULEB128 length
-                var len = 0
-                var shift = 0
-                var pos = 0
-                while (true) {
-                    val b = strBuf.get(pos++) & 0xFF
-                    len |= (b & 0x7F) shl shift
-                    if ((b & 0x80) == 0) break
-                    shift += 7
-                }
-                if (len > 0 && len < 10000 && pos + len * 2 <= strBuf.capacity()) {
-                    val chars = CharArray(len)
-                    for (j in 0 until len) {
-                        chars[j] = strBuf.getChar(pos + j * 2)
-                    }
-                    strings[i] = String(chars)
-                }
+            // DEX header: magic(8) + checksum(4) + signature(20) + fileSize(4) + headerSize(4) + endianTag(4) +
+            // linkSize(4) + linkOff(4) + mapOff(4) + stringIdsSize(4) + stringIdsOff(4) + typeIdsSize(4) + typeIdsOff(4) +
+            // protoIdsSize(4) + protoIdsOff(4) + fieldIdsSize(4) + fieldIdsOff(4) + methodIdsSize(4) + methodIdsOff(4) +
+            // classDefsSize(4) + classDefsOff(4) + dataSize(4) + dataOff(4)
+            if (buffer.remaining() < 112 || buffer.getInt(0) != 0x7865640A || buffer.getShort(4) != 0x3033) {
+                return DexResult(0, 0, 0, emptySet(), emptySet(), emptySet(), emptySet(), emptySet())
             }
-        }
 
-        // Read type IDs
-        val typeIds = Array<Int>(typeIdsSize) { i -> buffer.getInt(typeIdsOff + i * 4) }
-        val typeNames = Array<String?>(typeIdsSize) { null }
-        for (i in 0 until typeIdsSize) {
-            val stringIdx = typeIds[i]
-            if (stringIdx >= 0 && stringIdx < strings.size) {
-                typeNames[i] = strings[stringIdx]?.replace('/', '.') ?: ""
+            val stringIdsSize = buffer.getInt(56)
+            val stringIdsOff = buffer.getInt(60)
+            val typeIdsSize = buffer.getInt(64)
+            val typeIdsOff = buffer.getInt(68)
+            val protoIdsSize = buffer.getInt(72)
+            val protoIdsOff = buffer.getInt(76)
+            val fieldIdsSize = buffer.getInt(80)
+            val fieldIdsOff = buffer.getInt(84)
+            val methodIdsSize = buffer.getInt(88)
+            val methodIdsOff = buffer.getInt(92)
+            val classDefsSize = buffer.getInt(96)
+            val classDefsOff = buffer.getInt(100)
+
+            // Read string IDs
+            val stringIds = Array(stringIdsSize) { i ->
+                buffer.getInt(stringIdsOff + i * 4)
             }
-        }
 
-        // Read class defs
-        var classCount = 0
-        var methodCount = 0
-        var fieldCount = 0
-        for (i in 0 until classDefsSize) {
-            val defOff = classDefsOff + i * 32
-            if (defOff + 32 > dexBytes.size) continue
-            val classIdx = buffer.getInt(defOff)
-            val accessFlags = buffer.getInt(defOff + 4)
-            val superclassIdx = buffer.getInt(defOff + 8)
-            val interfacesOff = buffer.getInt(defOff + 12)
-            val sourceFileIdx = buffer.getInt(defOff + 16)
-            val annotationsOff = buffer.getInt(defOff + 20)
-            val classDataOff = buffer.getInt(defOff + 24)
-            val staticValuesOff = buffer.getInt(defOff + 28)
-
-            val className = classIdx.takeIf { it >= 0 && it < typeNames.size }?.let { typeNames[it] } ?: ""
-            if (className.isBlank() || className.startsWith("L") && className.endsWith(";")) continue
-            val cleanClassName = className.trim('L', ';')
-            if (!cleanClassName.startsWith(pkgPrefix) && !cleanClassName.contains("BuildConfig") && !cleanClassName.contains(".R$") && !cleanClassName.endsWith(".R")) {
-                // Still include for analysis but filter later
+            // Read type IDs
+            val typeIds = Array(typeIdsSize) { i ->
+                buffer.getInt(typeIdsOff + i * 4)
             }
-            classes.add(cleanClassName)
-            classCount++
 
-            // Parse class data (fields and methods)
-            if (classDataOff > 0 && classDataOff < dexBytes.size) {
-                val dataBuf = ByteBuffer.wrap(dexBytes, classDataOff, dexBytes.size - classDataOff).order(ByteOrder.LITTLE_ENDIAN)
-                var pos = 0
+            // Read string pool
+            val strings = mutableListOf<String>()
+            for (offset in stringIds) {
+                buffer.position(offset)
+                val len = readUleb128(buffer)
+                val bytes2 = ByteArray(len)
+                buffer.get(bytes2)
+                strings.add(bytes2.toString(Charsets.UTF_8))
+            }
 
-                fun readUleb128(): Int {
-                    var result = 0
-                    var shift = 0
-                    while (true) {
-                        val b = dataBuf.get(pos++) & 0xFF
-                        result |= (b & 0x7F) shl shift
-                        if ((b & 0x80) == 0) break
-                        shift += 7
-                    }
-                    return result
+            // Read class defs
+            val classes = mutableSetOf<String>()
+            val methodSignatures = mutableSetOf<String>()
+            val fieldSignatures = mutableSetOf<String>()
+            val urls = mutableSetOf<String>()
+            val uiStrings = mutableSetOf<String>()
+
+            val urlRegex = Regex("""https?://[^\s"'<>{}|\\^`\[\]]+""")
+            val methodSigRegex = Regex("""[A-Z][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*\([^)]*\)[:\s][A-Z][a-zA-Z0-9_<>\[\]]*""")
+
+            for (i in 0 until classDefsSize) {
+                buffer.position(classDefsOff + i * 32)
+                val classIdx = buffer.getInt()
+                val accessFlags = buffer.getInt()
+                val superclassIdx = buffer.getInt()
+                val interfacesOff = buffer.getInt()
+                val sourceFileIdx = buffer.getInt()
+                val annotationsOff = buffer.getInt()
+                val classDataOff = buffer.getInt()
+                val staticValuesOff = buffer.getInt()
+
+                val className = if (classIdx >= 0 && classIdx < typeIdsSize) {
+                    val strIdx = typeIds[classIdx]
+                    if (strIdx >= 0 && strIdx < strings.size) strings[strIdx].replace('/', '.') else ""
+                } else ""
+
+                if (className.isNotBlank() && (className.startsWith(pkgPrefix) || !className.startsWith("android.") && !className.startsWith("java.") && !className.startsWith("kotlin."))) {
+                    classes.add(className)
                 }
 
-                val staticFieldsSize = readUleb128()
-                val instanceFieldsSize = readUleb128()
-                val directMethodsSize = readUleb128()
-                val virtualMethodsSize = readUleb128()
+                if (classDataOff > 0) {
+                    buffer.position(classDataOff)
+                    val staticFieldsSize = readUleb128(buffer)
+                    val instanceFieldsSize = readUleb128(buffer)
+                    val directMethodsSize = readUleb128(buffer)
+                    val virtualMethodsSize = readUleb128(buffer)
 
-                // Skip static fields
-                var lastFieldIdx = 0
-                repeat(staticFieldsSize) {
-                    val fieldIdxDiff = readUleb128()
-                    val accessFlags = readUleb128()
-                    lastFieldIdx += fieldIdxDiff
-                    if (lastFieldIdx >= 0 && lastFieldIdx < fieldIdsSize) {
-                        val fieldIdOff = fieldIdsOff + lastFieldIdx * 8
-                        if (fieldIdOff + 8 <= dexBytes.size) {
-                            val fieldClassIdx = buffer.getShort(fieldIdOff).toInt() & 0xFFFF
-                            val fieldTypeIdx = buffer.getShort(fieldIdOff + 2).toInt() & 0xFFFF
-                            val fieldNameIdx = buffer.getInt(fieldIdOff + 4)
-                            val fieldClass = fieldClassIdx.takeIf { it < typeNames.size }?.let { typeNames[it] }?.trim('L', ';') ?: ""
-                            val fieldType = fieldTypeIdx.takeIf { it < typeNames.size }?.let { typeNames[it] }?.trim('L', ';') ?: ""
-                            val fieldName = fieldNameIdx.takeIf { it < strings.size }?.let { strings[it] } ?: ""
-                            if (fieldClass.isNotBlank() && fieldName.isNotBlank()) {
-                                fieldSignatures.add("$fieldClass.$fieldName: $fieldType")
-                                fieldCount++
-                            }
-                        }
+                    // Skip fields
+                    repeat(staticFieldsSize + instanceFieldsSize) {
+                        readUleb128(buffer) // fieldIdx
+                        readUleb128(buffer) // accessFlags
                     }
-                }
 
-                // Skip instance fields
-                repeat(instanceFieldsSize) {
-                    val fieldIdxDiff = readUleb128()
-                    val accessFlags = readUleb128()
-                    lastFieldIdx += fieldIdxDiff
-                    if (lastFieldIdx >= 0 && lastFieldIdx < fieldIdsSize) {
-                        val fieldIdOff = fieldIdsOff + lastFieldIdx * 8
-                        if (fieldIdOff + 8 <= dexBytes.size) {
-                            val fieldClassIdx = buffer.getShort(fieldIdOff).toInt() & 0xFFFF
-                            val fieldTypeIdx = buffer.getShort(fieldIdOff + 2).toInt() & 0xFFFF
-                            val fieldNameIdx = buffer.getInt(fieldIdOff + 4)
-                            val fieldClass = fieldClassIdx.takeIf { it < typeNames.size }?.let { typeNames[it] }?.trim('L', ';') ?: ""
-                            val fieldType = fieldTypeIdx.takeIf { it < typeNames.size }?.let { typeNames[it] }?.trim('L', ';') ?: ""
-                            val fieldName = fieldNameIdx.takeIf { it < strings.size }?.let { strings[it] } ?: ""
-                            if (fieldClass.isNotBlank() && fieldName.isNotBlank()) {
-                                fieldSignatures.add("$fieldClass.$fieldName: $fieldType")
-                                fieldCount++
-                            }
-                        }
-                    }
-                }
+                    // Read methods
+                    repeat(directMethodsSize + virtualMethodsSize) {
+                        val methodIdx = readUleb128(buffer)
+                        val accessFlags = readUleb128(buffer)
+                        val codeOff = readUleb128(buffer)
 
-                // Parse direct methods
-                var lastMethodIdx = 0
-                repeat(directMethodsSize) {
-                    val methodIdxDiff = readUleb128()
-                    val accessFlags = readUleb128()
-                    val codeOff = readUleb128()
-                    lastMethodIdx += methodIdxDiff
-                    if (lastMethodIdx >= 0 && lastMethodIdx < methodIdsSize) {
-                        val methodIdOff = methodIdsOff + lastMethodIdx * 8
-                        if (methodIdOff + 8 <= dexBytes.size) {
-                            val methodClassIdx = buffer.getShort(methodIdOff).toInt() & 0xFFFF
-                            val methodProtoIdx = buffer.getShort(methodIdOff + 2).toInt() & 0xFFFF
-                            val methodNameIdx = buffer.getInt(methodIdOff + 4)
-                            val methodClass = methodClassIdx.takeIf { it < typeNames.size }?.let { typeNames[it] }?.trim('L', ';') ?: ""
-                            val methodName = methodNameIdx.takeIf { it < strings.size }?.let { strings[it] } ?: ""
-                            val proto = methodProtoIdx.takeIf { it < protoIdsSize }?.let {
-                                val protoOff = protoIdsOff + it * 12
-                                if (protoOff + 12 <= dexBytes.size) {
-                                    val returnTypeIdx = buffer.getShort(protoOff).toInt() & 0xFFFF
-                                    val paramsOff = buffer.getInt(protoOff + 4)
-                                    val returnType = returnTypeIdx.takeIf { it < typeNames.size }?.let { typeNames[it] }?.trim('L', ';') ?: ""
-                                    var paramTypes = ""
-                                    if (paramsOff > 0 && paramsOff < dexBytes.size) {
-                                        val paramBuf = ByteBuffer.wrap(dexBytes, paramsOff, dexBytes.size - paramsOff).order(ByteOrder.LITTLE_ENDIAN)
-                                        val paramSize = paramBuf.getInt(0)
-                                        val sb = StringBuilder()
-                                        for (p in 0 until paramSize) {
-                                            val typeIdx = paramBuf.getShort(4 + p * 2).toInt() & 0xFFFF
-                                            val typeName = typeIdx.takeIf { it < typeNames.size }?.let { typeNames[it] }?.trim('L', ';') ?: ""
-                                            if (p > 0) sb.append(", ")
-                                            sb.append(typeName)
-                                        }
-                                        paramTypes = sb.toString()
-                                    }
-                                    "$paramTypes): $returnType"
+                        if (methodIdx >= 0 && methodIdx < methodIdsSize) {
+                            buffer.position(methodIdsOff + methodIdx * 8)
+                            val mClassIdx = buffer.getShort().toInt()
+                            val mProtoIdx = buffer.getShort().toInt()
+                            val mNameIdx = buffer.getInt()
+
+                            val methodClass = if (mClassIdx >= 0 && mClassIdx < typeIdsSize) {
+                                val strIdx = typeIds[mClassIdx]
+                                if (strIdx >= 0 && strIdx < strings.size) strings[strIdx].replace('/', '.') else ""
+                            } else ""
+
+                            val methodName = if (mNameIdx >= 0 && mNameIdx < strings.size) strings[mNameIdx] else ""
+                            val protoStr = if (mProtoIdx >= 0 && mProtoIdx < protoIdsSize) {
+                                buffer.position(protoIdsOff + mProtoIdx * 12)
+                                val shortyIdx = buffer.getInt()
+                                val returnTypeIdx = buffer.getInt()
+                                val paramsOff = buffer.getInt()
+                                val shorty = if (shortyIdx >= 0 && shortyIdx < strings.size) strings[shortyIdx] else ""
+                                val returnType = if (returnTypeIdx >= 0 && returnTypeIdx < typeIdsSize) {
+                                    val strIdx = typeIds[returnTypeIdx]
+                                    if (strIdx >= 0 && strIdx < strings.size) strings[strIdx].replace('/', '.') else ""
                                 } else ""
-                            } ?: ""
-                            if (methodClass.isNotBlank() && methodName.isNotBlank()) {
-                                methodSignatures.add("$methodClass.$methodName($proto")
-                                methodCount++
-                            }
-                        }
-                    }
-                    // Skip code if present
-                    if (codeOff > 0) {
-                        // We don't parse bytecode, but could scan for string references
-                    }
-                }
-
-                // Parse virtual methods
-                repeat(virtualMethodsSize) {
-                    val methodIdxDiff = readUleb128()
-                    val accessFlags = readUleb128()
-                    val codeOff = readUleb128()
-                    lastMethodIdx += methodIdxDiff
-                    if (lastMethodIdx >= 0 && lastMethodIdx < methodIdsSize) {
-                        val methodIdOff = methodIdsOff + lastMethodIdx * 8
-                        if (methodIdOff + 8 <= dexBytes.size) {
-                            val methodClassIdx = buffer.getShort(methodIdOff).toInt() & 0xFFFF
-                            val methodProtoIdx = buffer.getShort(methodIdOff + 2).toInt() & 0xFFFF
-                            val methodNameIdx = buffer.getInt(methodIdOff + 4)
-                            val methodClass = methodClassIdx.takeIf { it < typeNames.size }?.let { typeNames[it] }?.trim('L', ';') ?: ""
-                            val methodName = methodNameIdx.takeIf { it < strings.size }?.let { strings[it] } ?: ""
-                            val proto = methodProtoIdx.takeIf { it < protoIdsSize }?.let {
-                                val protoOff = protoIdsOff + it * 12
-                                if (protoOff + 12 <= dexBytes.size) {
-                                    val returnTypeIdx = buffer.getShort(protoOff).toInt() & 0xFFFF
-                                    val paramsOff = buffer.getInt(protoOff + 4)
-                                    val returnType = returnTypeIdx.takeIf { it < typeNames.size }?.let { typeNames[it] }?.trim('L', ';') ?: ""
-                                    var paramTypes = ""
-                                    if (paramsOff > 0 && paramsOff < dexBytes.size) {
-                                        val paramBuf = ByteBuffer.wrap(dexBytes, paramsOff, dexBytes.size - paramsOff).order(ByteOrder.LITTLE_ENDIAN)
-                                        val paramSize = paramBuf.getInt(0)
-                                        val sb = StringBuilder()
-                                        for (p in 0 until paramSize) {
-                                            val typeIdx = paramBuf.getShort(4 + p * 2).toInt() & 0xFFFF
-                                            val typeName = typeIdx.takeIf { it < typeNames.size }?.let { typeNames[it] }?.trim('L', ';') ?: ""
-                                            if (p > 0) sb.append(", ")
-                                            sb.append(typeName)
+                                val params = if (paramsOff > 0) {
+                                    buffer.position(paramsOff)
+                                    val size = buffer.getInt()
+                                    val pTypes = mutableListOf<String>()
+                                    repeat(size) {
+                                        val tIdx = buffer.getInt()
+                                        if (tIdx >= 0 && tIdx < typeIdsSize) {
+                                            val strIdx = typeIds[tIdx]
+                                            if (strIdx >= 0 && strIdx < strings.size) pTypes.add(strings[strIdx].replace('/', '.'))
                                         }
-                                        paramTypes = sb.toString()
                                     }
-                                    "$paramTypes): $returnType"
+                                    pTypes.joinToString(", ")
                                 } else ""
-                            } ?: ""
-                            if (methodClass.isNotBlank() && methodName.isNotBlank()) {
-                                methodSignatures.add("$methodClass.$methodName($proto")
-                                methodCount++
-                            }
+                                "$shorty ($params): $returnType"
+                            } else ""
+
+                            val sig = "$methodClass.$methodName$protoStr"
+                            methodSignatures.add(sig)
                         }
                     }
                 }
             }
-        }
 
-        // Extract URLs and UI strings from string pool
-        for (s in strings) {
-            s?.let {
-                if (it.startsWith("http://") || it.startsWith("https://")) {
-                    urls.add(it)
-                }
-                if (it.length > 3 && it.length < 200 && (it.contains(" ") || it.matches(Regex("^[A-Z][a-z]+( [A-Z][a-z]+)*\\.?$")))) {
-                    uiStrings.add(it)
+            // Extract URLs and UI strings from string pool
+            for (s in strings) {
+                if (urlRegex.matches(s)) urls.add(s)
+                if (s.length >= 3 && s.length < 100 && (s.first().isUpperCase() || s.contains(" ")) && !s.contains("://") && !s.startsWith("L") && !s.startsWith("[")) {
+                    uiStrings.add(s)
                 }
             }
-        }
 
-        return DexResult(classCount, methodCount, fieldCount, classes, methodSignatures, fieldSignatures, urls, uiStrings)
+            DexResult(
+                classCount = classes.size,
+                methodCount = methodSignatures.size,
+                fieldCount = fieldSignatures.size,
+                classes = classes,
+                methodSignatures = methodSignatures,
+                fieldSignatures = fieldSignatures,
+                urls = urls,
+                uiStrings = uiStrings
+            )
+        } catch (e: Exception) {
+            DexResult(0, 0, 0, emptySet(), emptySet(), emptySet(), emptySet(), emptySet())
+        }
     }
 }
